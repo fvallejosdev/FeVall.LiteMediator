@@ -18,6 +18,20 @@ namespace FeVall.LiteMediator.Messaging
         /// </summary>
         public int BackgroundQueueCapacity { get; set; } = 0;
 
+        /// <summary>
+        /// Reintentos por handler en background ante excepciones. Por defecto 0 (desactivado:
+        /// un handler que falla se loguea y se continúa con el siguiente).
+        /// El reintento es POR HANDLER, no por evento: los que ya tuvieron éxito no se repiten.
+        /// Agotados los reintentos, el handler se da por perdido y se continúa con el resto.
+        /// </summary>
+        public int BackgroundMaxRetries { get; set; } = 0;
+
+        /// <summary>
+        /// Espera base entre reintentos en background. Se aplica backoff exponencial:
+        /// delay, 2×delay, 4×delay, …
+        /// </summary>
+        public TimeSpan BackgroundRetryDelay { get; set; } = TimeSpan.FromSeconds(2);
+
         internal void Validate()
         {
             if (BackgroundWorkers < 1)
@@ -25,7 +39,12 @@ namespace FeVall.LiteMediator.Messaging
 
             if (BackgroundQueueCapacity < 0)
                 throw new ArgumentOutOfRangeException(nameof(BackgroundQueueCapacity), "No puede ser negativa (0 = ilimitada).");
+
+            if (BackgroundMaxRetries < 0)
+                throw new ArgumentOutOfRangeException(nameof(BackgroundMaxRetries), "No puede ser negativo (0 = desactivado).");
+
+            if (BackgroundMaxRetries > 0 && BackgroundRetryDelay <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(BackgroundRetryDelay), "Debe ser mayor que cero si hay reintentos activados.");
         }
     }
-
 }
