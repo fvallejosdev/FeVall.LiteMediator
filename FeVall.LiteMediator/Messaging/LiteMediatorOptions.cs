@@ -32,6 +32,12 @@ namespace FeVall.LiteMediator.Messaging
         /// </summary>
         public TimeSpan BackgroundRetryDelay { get; set; } = TimeSpan.FromSeconds(2);
 
+        /// <summary>
+        /// Umbral de eventos pendientes a partir del cual el health check "litemediator" pasa a Degraded.
+        /// 0 = sin límite (solo se comprueba que los workers estén vivos).
+        /// </summary>
+        public int HealthCheckQueueThreshold { get; set; } = 0;
+
         internal void Validate()
         {
             if (BackgroundWorkers < 1)
@@ -45,6 +51,9 @@ namespace FeVall.LiteMediator.Messaging
 
             if (BackgroundMaxRetries > 0 && BackgroundRetryDelay <= TimeSpan.Zero)
                 throw new ArgumentOutOfRangeException(nameof(BackgroundRetryDelay), "Debe ser mayor que cero si hay reintentos activados.");
+
+            if (HealthCheckQueueThreshold < 0)
+                throw new ArgumentOutOfRangeException(nameof(HealthCheckQueueThreshold), "No puede ser negativo (0 = sin límite).");
         }
     }
 }

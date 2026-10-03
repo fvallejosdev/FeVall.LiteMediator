@@ -1,5 +1,6 @@
 ﻿using FeVall.LiteMediator.Messaging;
 using System.Threading.Channels;
+using FeVall.LiteMediator.Internal;
 
 namespace FeVall.LiteMediator.Channels
 {
@@ -7,6 +8,9 @@ namespace FeVall.LiteMediator.Channels
     {
         ValueTask EnqueueAsync(IEvent @event, CancellationToken ct = default);
         IAsyncEnumerable<IEvent> ReadAllAsync(CancellationToken ct);
+
+        /// <summary>Eventos pendientes de procesar (para métricas y health checks).</summary>
+        int PendingCount { get; }
 
         /// <summary>Cierra la cola: no admite más eventos, pero los pendientes aún pueden leerse (drenaje).</summary>
         void Complete();
@@ -30,7 +34,12 @@ namespace FeVall.LiteMediator.Channels
                 {
                     SingleReader = singleReader
                 });
+
+            // Gauge de profundidad de cola: sin listener de métricas es un no-op.
+            LiteMediatorDiagnostics.RegisterQueueDepthGauge(() => _channel.Reader.Count);
         }
+
+        public int PendingCount => _channel.Reader.Count;
 
         public ValueTask EnqueueAsync(IEvent @event, CancellationToken ct = default)
         {
@@ -42,5 +51,4 @@ namespace FeVall.LiteMediator.Channels
 
         public void Complete() => _channel.Writer.TryComplete();
     }
-
 }

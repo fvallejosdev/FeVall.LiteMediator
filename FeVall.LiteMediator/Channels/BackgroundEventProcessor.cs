@@ -1,6 +1,7 @@
 ﻿using FeVall.LiteMediator.Messaging;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -13,6 +14,7 @@ namespace FeVall.LiteMediator.Channels
     /// Consume la cola de eventos en background con N workers.
     /// Al apagar el host, cierra la cola y drena los eventos pendientes hasta agotar el ShutdownTimeout del host;
     /// pasado ese tiempo cancela los handlers en curso y descarta lo que quede.
+    /// Si BackgroundMaxRetries > 0, cada handler se reintenta con backoff exponencial antes de darse por perdido.
     /// </summary>
     internal sealed class BackgroundEventProcessor(
         IBackgroundEventQueue queue,
@@ -22,10 +24,28 @@ namespace FeVall.LiteMediator.Channels
         ILogger<BackgroundEventProcessor> logger) : IHostedService, IDisposable
     {
         private readonly CancellationTokenSource _forceStop = new();
+
         private readonly Action<Exception, Type> _onHandlerError = (ex, handlerType) =>
+        {
+            LiteMediatorDiagnostics.BackgroundHandlerFailures.Add(1,
+                new TagList { { "litemediator.handler", handlerType.FullName } });
             logger.LogError(ex, "FeVall.LiteMediator: el handler {Handler} falló procesando un evento en background.", handlerType.Name);
+        };
+
+        private readonly Action<Exception, Type, int, TimeSpan> _onHandlerRetry = (ex, handlerType, attempt, delay) =>
+        {
+            LiteMediatorDiagnostics.BackgroundHandlerRetries.Add(1,
+                new TagList { { "litemediator.handler", handlerType.FullName } });
+            logger.LogWarning(ex, "FeVall.LiteMediator: el handler {Handler} falló (intento {Attempt}); reintento en {Delay}.",
+                handlerType.Name, attempt, delay);
+        };
 
         private Task[] _workers = [];
+        private volatile Exception? _workerFault;
+
+        /// <summary>True si algún worker murió por una excepción no controlada (lo consulta el health check).</summary>
+        internal bool HasFaulted => _workerFault is not null;
+        internal Exception? WorkerFault => _workerFault;
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
@@ -63,11 +83,22 @@ namespace FeVall.LiteMediator.Channels
             {
                 // Apagado forzado: salida silenciosa.
             }
+            catch (Exception ex)
+            {
+                // Defensa en profundidad: ProcessAsync ya atrapa todo, pero si algo se escapa,
+                // el worker muere y el health check lo reporta como Unhealthy.
+                _workerFault = ex;
+                logger.LogCritical(ex, "FeVall.LiteMediator: un worker de eventos en background murió; la cola ya no se drena al completo.");
+            }
         }
 
         private async Task ProcessAsync(IEvent @event, CancellationToken ct)
         {
             var eventType = @event.GetType();
+            var tags = new TagList { { "litemediator.event_type", eventType.FullName } };
+
+            using var activity = LiteMediatorDiagnostics.Source.StartActivity("litemediator.background.process");
+            activity?.SetTag("litemediator.event_type", eventType.FullName);
 
             if (!registry.Events.TryGetValue(eventType, out var wrapper))
             {
@@ -75,11 +106,15 @@ namespace FeVall.LiteMediator.Channels
                 return;
             }
 
+            var start = Stopwatch.GetTimestamp();
             try
             {
                 // Scope propio por evento: aislado de la petición HTTP que lo originó.
                 await using var scope = scopeFactory.CreateAsyncScope();
-                await wrapper.HandleAsync(@event, scope.ServiceProvider, ct, _onHandlerError);
+                await wrapper.HandleAsync(@event, scope.ServiceProvider, ct, _onHandlerError,
+                    options.BackgroundMaxRetries, options.BackgroundRetryDelay, _onHandlerRetry);
+
+                LiteMediatorDiagnostics.BackgroundProcessed.Add(1, tags);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -87,7 +122,12 @@ namespace FeVall.LiteMediator.Channels
             }
             catch (Exception ex)
             {
+                activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
                 logger.LogError(ex, "FeVall.LiteMediator: error procesando el evento en background {EventType}.", eventType.Name);
+            }
+            finally
+            {
+                LiteMediatorDiagnostics.BackgroundEventDuration.Record(Stopwatch.GetElapsedTime(start).TotalMilliseconds, tags);
             }
         }
 

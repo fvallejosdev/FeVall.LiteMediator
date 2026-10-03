@@ -96,9 +96,13 @@ namespace FeVall.LiteMediator.DependencyInjection
                 eventWrappers.ToFrozenDictionary()));
 
             services.AddSingleton<IBackgroundEventQueue, BackgroundEventQueue>();
-            services.AddHostedService<BackgroundEventProcessor>();
+            // Registrado como tipo concreto para que el health check pueda consultar su estado;
+            // el hosted service es el MISMO singleton.
+            services.AddSingleton<BackgroundEventProcessor>();
+            services.AddHostedService(sp => sp.GetRequiredService<BackgroundEventProcessor>());
 
             services.AddScoped<ILiteMediator, LiteMediatorImpl>();
+            
 
             return services;
         }
