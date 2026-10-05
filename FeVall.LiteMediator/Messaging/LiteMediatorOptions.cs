@@ -38,6 +38,14 @@ namespace FeVall.LiteMediator.Messaging
         /// </summary>
         public int HealthCheckQueueThreshold { get; set; } = 0;
 
+        /// <summary>
+        /// Si es true (por defecto), al registrar se comprueba que TODA solicitud concreta
+        /// (IRequest/Command/Query) encontrada en los assemblies escaneados tenga su handler.
+        /// Fail-fast: la app no arranca con handlers huérfanos en vez de fallar en runtime
+        /// en la primera llamada. Los eventos NO se validan: 0 handlers es válido en pub/sub.
+        /// </summary>
+        public bool ValidateHandlersOnStartup { get; set; } = true;
+
         internal void Validate()
         {
             if (BackgroundWorkers < 1)

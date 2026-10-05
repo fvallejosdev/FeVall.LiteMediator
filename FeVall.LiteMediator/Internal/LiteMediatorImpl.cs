@@ -1,5 +1,6 @@
 ﻿using FeVall.LiteMediator.Channels;
 using FeVall.LiteMediator.Messaging;
+using Microsoft.Extensions.Logging;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -10,7 +11,8 @@ namespace FeVall.LiteMediator.Internal
     internal sealed class LiteMediatorImpl(
         IServiceProvider serviceProvider,
         HandlerRegistry registry,
-        IBackgroundEventQueue backgroundQueue) : ILiteMediator
+        IBackgroundEventQueue backgroundQueue,
+        ILogger<LiteMediatorImpl> logger) : ILiteMediator
     {
         public async Task<TResponse> SendAsync<TResponse>(IRequest<TResponse> request, CancellationToken ct = default)
         {
@@ -44,6 +46,9 @@ namespace FeVall.LiteMediator.Internal
             }
         }
 
+        public Task SendAsync(ICommand command, CancellationToken ct = default)
+            => SendAsync<Unit>(command, ct);
+
         public async Task PublishAsync<TEvent>(TEvent @event, CancellationToken ct = default) where TEvent : IEvent
         {
             ArgumentNullException.ThrowIfNull(@event);
@@ -55,12 +60,18 @@ namespace FeVall.LiteMediator.Internal
             activity?.SetTag("litemediator.event_type", eventType.FullName);
             LiteMediatorDiagnostics.EventsPublished.Add(1, tags);
 
+            // Se resuelve por el tipo en runtime: funciona aunque la variable esté declarada como IEvent.
+            if (!registry.Events.TryGetValue(eventType, out var wrapper))
+            {
+                // En pub/sub, 0 suscriptores es legítimo; se deja rastro en Debug para depurar "¿por qué no pasó nada?".
+                logger.LogDebug("FeVall.LiteMediator: PublishAsync de {EventType} sin handlers registrados.", eventType.Name);
+                return;
+            }
+
             var start = Stopwatch.GetTimestamp();
             try
             {
-                // Se resuelve por el tipo en runtime: funciona aunque la variable esté declarada como IEvent.
-                if (registry.Events.TryGetValue(eventType, out var wrapper))
-                    await wrapper.HandleAsync(@event, serviceProvider, ct);
+                await wrapper.HandleAsync(@event, serviceProvider, ct);
             }
             catch (Exception ex)
             {
@@ -76,8 +87,16 @@ namespace FeVall.LiteMediator.Internal
         public ValueTask EnqueueBackgroundAsync<TEvent>(TEvent @event, CancellationToken ct = default) where TEvent : IEvent
         {
             ArgumentNullException.ThrowIfNull(@event);
+
+            var eventType = @event.GetType();
+
+            // Fail-fast: encolar un evento sin handlers no tendría efecto; mejor un error aquí que un warning a destiempo.
+            if (!registry.Events.ContainsKey(eventType))
+                throw new InvalidOperationException(
+                    $"FeVall.LiteMediator: el evento {eventType.Name} no tiene handlers registrados; encolarlo no tendría efecto.");
+
             LiteMediatorDiagnostics.BackgroundEnqueued.Add(1,
-                new TagList { { "litemediator.event_type", @event.GetType().FullName } });
+                new TagList { { "litemediator.event_type", eventType.FullName } });
             return backgroundQueue.EnqueueAsync(@event, ct);
         }
     }

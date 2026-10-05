@@ -22,7 +22,7 @@ namespace FeVall.LiteMediator.DependencyInjection
         public static IServiceCollection AddFeVallLiteMediator(this IServiceCollection services, params Assembly[] assemblies)
             => services.AddFeVallLiteMediator(configure: null, assemblies);
 
-        /// <summary>Registra el mediador permitiendo configurar workers y capacidad de la cola en background.</summary>
+        /// <summary>Registra el mediador permitiendo configurar workers, cola, reintentos y validación.</summary>
         [RequiresUnreferencedCode(ScanWarning)]
         [RequiresDynamicCode(ScanWarning)]
         public static IServiceCollection AddFeVallLiteMediator(
@@ -47,7 +47,14 @@ namespace FeVall.LiteMediator.DependencyInjection
             var requestOwners = new Dictionary<Type, Type>();
             var eventWrappers = new Dictionary<Type, EventHandlerWrapper>();
 
-            foreach (var type in assemblies.Distinct().SelectMany(a => a.GetTypes()))
+            // Los AddScoped se difieren: si alguna validación falla, el contenedor queda intacto.
+            var registrations = new List<(Type ServiceType, Type ImplementationType)>();
+
+            // Distinct() por tipo: si el mismo assembly llega por dos rutas (o dos assemblies exponen
+            // el mismo tipo por type-forwarding), los handlers no se registran ni ejecutan dos veces.
+            var scannedTypes = assemblies.Distinct().SelectMany(a => a.GetTypes()).Distinct().ToList();
+
+            foreach (var type in scannedTypes)
             {
                 if (type.IsAbstract || type.IsInterface || type.IsGenericTypeDefinition)
                     continue;
@@ -74,7 +81,7 @@ namespace FeVall.LiteMediator.DependencyInjection
                         requestWrappers[requestType] = (RequestHandlerBase)Activator.CreateInstance(
                             typeof(RequestHandlerWrapperImpl<,>).MakeGenericType(args))!;
 
-                        services.AddScoped(iface, type);
+                        registrations.Add((iface, type));
                     }
                     else if (definition == typeof(IEventHandler<>))
                     {
@@ -84,10 +91,16 @@ namespace FeVall.LiteMediator.DependencyInjection
                             eventWrappers[eventType] = (EventHandlerWrapper)Activator.CreateInstance(
                                 typeof(EventHandlerWrapperImpl<>).MakeGenericType(eventType))!;
 
-                        services.AddScoped(iface, type);
+                        registrations.Add((iface, type));
                     }
                 }
             }
+
+            if (options.ValidateHandlersOnStartup)
+                ValidateAllRequestsHaveHandler(scannedTypes, requestWrappers);
+
+            foreach (var (serviceType, implementationType) in registrations)
+                services.AddScoped(serviceType, implementationType);
 
             // Mapas inmutables: se construyen una vez y se leen sin sincronización.
             services.AddSingleton(options);
@@ -96,15 +109,42 @@ namespace FeVall.LiteMediator.DependencyInjection
                 eventWrappers.ToFrozenDictionary()));
 
             services.AddSingleton<IBackgroundEventQueue, BackgroundEventQueue>();
+
             // Registrado como tipo concreto para que el health check pueda consultar su estado;
             // el hosted service es el MISMO singleton.
             services.AddSingleton<BackgroundEventProcessor>();
             services.AddHostedService(sp => sp.GetRequiredService<BackgroundEventProcessor>());
 
-            services.AddScoped<ILiteMediator, LiteMediatorImpl>();
-            
+            // Transient como MediatR: la impl es liviana y captura el IServiceProvider de quien la recibe.
+            // Ojo: inyectarla en un singleton hará que los handlers scoped fallen al resolverse (restricción de DI, no del mediador).
+            services.AddTransient<ILiteMediator, LiteMediatorImpl>();
 
             return services;
+        }
+
+        /// <summary>
+        /// Fail-fast: toda solicitud concreta encontrada en los assemblies escaneados debe tener handler.
+        /// Los handlers abstractos y las definiciones genéricas abiertas se ignoran.
+        /// </summary>
+        private static void ValidateAllRequestsHaveHandler(
+            List<Type> scannedTypes, Dictionary<Type, RequestHandlerBase> requestWrappers)
+        {
+            var orphans = scannedTypes
+                .Where(t => !t.IsAbstract && !t.IsInterface && !t.IsGenericTypeDefinition)
+                .Where(t => t.GetInterfaces().Any(i =>
+                    i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IRequest<>)))
+                .Where(t => !requestWrappers.ContainsKey(t))
+                .OrderBy(t => t.FullName, StringComparer.Ordinal)
+                .ToList();
+
+            if (orphans.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "FeVall.LiteMediator: hay solicitudes sin handler: " +
+                    string.Join(", ", orphans.Select(t => t.Name)) +
+                    ". Registra un handler para cada una, incluye el assembly que la contiene en la llamada " +
+                    "o desactiva LiteMediatorOptions.ValidateHandlersOnStartup.");
+            }
         }
 
         /// <summary>
@@ -113,9 +153,21 @@ namespace FeVall.LiteMediator.DependencyInjection
         /// </summary>
         public static IServiceCollection AddLiteMediatorPipeline(this IServiceCollection services, Type pipelineBehaviorType)
         {
+            ArgumentNullException.ThrowIfNull(pipelineBehaviorType);
+
+            if (!pipelineBehaviorType.IsGenericTypeDefinition || pipelineBehaviorType.IsAbstract)
+                throw new ArgumentException(
+                    $"El pipeline debe ser un tipo genérico abierto (ej. typeof(MiBehavior<,>)). Recibido: {pipelineBehaviorType.Name}.",
+                    nameof(pipelineBehaviorType));
+
+            if (!pipelineBehaviorType.GetInterfaces().Any(i =>
+                    i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IPipelineBehavior<,>)))
+                throw new ArgumentException(
+                    $"El tipo {pipelineBehaviorType.Name} no implementa IPipelineBehavior<,>.",
+                    nameof(pipelineBehaviorType));
+
             services.AddScoped(typeof(IPipelineBehavior<,>), pipelineBehaviorType);
             return services;
         }
     }
-
 }

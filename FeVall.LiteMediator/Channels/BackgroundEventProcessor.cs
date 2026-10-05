@@ -50,7 +50,11 @@ namespace FeVall.LiteMediator.Channels
         public Task StartAsync(CancellationToken cancellationToken)
         {
             _workers = Enumerable.Range(0, options.BackgroundWorkers)
-                .Select(_ => Task.Run(() => RunWorkerAsync(_forceStop.Token), CancellationToken.None))
+                .Select(_ => Task.Factory.StartNew(
+                    () => RunWorkerAsync(_forceStop.Token),
+                    CancellationToken.None,
+                    TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach,
+                    TaskScheduler.Default).Unwrap())
                 .ToArray();
 
             logger.LogInformation("FeVall.LiteMediator: {Count} worker(s) de eventos en background iniciados.", _workers.Length);
